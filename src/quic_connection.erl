@@ -90,6 +90,9 @@
     get_path_stats/1,
     %% Connection statistics (for liveness detection)
     get_stats/1,
+    %% 0-RTT accessors (RFC 9001 §4.6)
+    has_early_keys/1,
+    early_data_accepted/1,
     %% Peer transport parameters
     get_peer_transport_params/1,
     %% Transport-level PING (bypasses congestion control)
@@ -175,7 +178,14 @@
     test_decimate_step/1,
     test_decimate_on_timer_fire/1,
     test_maybe_send_ack_app/2,
-    test_classify_recv_trigger/2
+    test_classify_recv_trigger/2,
+    %% 0-RTT rejection (RFC 9001 §4.6.2)
+    test_state_for_zero_rtt_reset/3,
+    test_zero_rtt_reset_info/1,
+    test_finalize_zero_rtt_handshake/2,
+    test_reset_zero_rtt_streams/2,
+    test_client_state_for_ee/4,
+    test_process_encrypted_extensions/2
 ]).
 -endif.
 
@@ -597,6 +607,10 @@
     early_data_sent = 0 :: non_neg_integer(),
     % Server accepted early data
     early_data_accepted = false :: boolean(),
+    %% Streams that have carried 0-RTT-encrypted data. Used at handshake
+    %% completion to either retain (acceptance) or reset (rejection per
+    %% RFC 9001 §4.6.2) stream state.
+    zero_rtt_stream_ids = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
 
     %% QUIC-LB CID configuration (RFC 9312)
     cid_config :: #cid_config{} | undefined,
@@ -845,6 +859,22 @@ get_path_stats(Conn) ->
 -spec get_stats(pid()) -> {ok, map()} | {error, term()}.
 get_stats(Conn) ->
     gen_statem:call(Conn, get_stats).
+
+%% @doc Returns whether the connection has derived early keys (RFC 9001
+%% §4.6). True when a session ticket was supplied at connect time and
+%% send_client_hello/1 derived 0-RTT traffic keys; the H3 layer uses
+%% this to choose between the fresh-handshake and 0-RTT bootstraps.
+-spec has_early_keys(pid()) -> boolean().
+has_early_keys(Conn) ->
+    gen_statem:call(Conn, has_early_keys).
+
+%% @doc Returns whether the server accepted early data, or `unknown`
+%% if the handshake has not yet completed. Useful only after the
+%% connection enters the connected state to confirm that 0-RTT was
+%% actually used.
+-spec early_data_accepted(pid()) -> boolean() | unknown.
+early_data_accepted(Conn) ->
+    gen_statem:call(Conn, early_data_accepted).
 
 %% @doc Get peer's transport parameters.
 %% Returns the transport parameters received from the peer during handshake.
@@ -1680,6 +1710,10 @@ idle(cast, {close, Reason}, State) ->
     State1 = initiate_close(Reason, State),
     NewState = flush_dirty_timers(flush_socket_batch(State1)),
     {next_state, draining, NewState};
+idle({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+    {keep_state, State, [{reply, From, EK =/= undefined}]};
+idle({call, From}, early_data_accepted, State) ->
+    {keep_state, State, [{reply, From, unknown}]};
 idle(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, idle, State).
 
@@ -1769,6 +1803,10 @@ handshaking(cast, {close, Reason}, State) ->
     State1 = initiate_close(Reason, State),
     NewState = flush_dirty_timers(flush_socket_batch(State1)),
     {next_state, draining, NewState};
+handshaking({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+    {keep_state, State, [{reply, From, EK =/= undefined}]};
+handshaking({call, From}, early_data_accepted, State) ->
+    {keep_state, State, [{reply, From, unknown}]};
 handshaking(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, handshaking, State).
 
@@ -2241,6 +2279,10 @@ connected(info, {stream_deadline, StreamId}, State) ->
             %% Stream already closed or doesn't exist
             {keep_state, State}
     end;
+connected({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+    {keep_state, State, [{reply, From, EK =/= undefined}]};
+connected({call, From}, early_data_accepted, #state{early_data_accepted = EDA} = State) ->
+    {keep_state, State, [{reply, From, EDA}]};
 connected(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, connected, State).
 
@@ -2287,6 +2329,10 @@ draining(info, {udp, _Socket, _IP, _Port, _Data}, State) ->
 draining(cast, {close, _Reason}, State) ->
     %% Ignore duplicate close requests - already draining
     {keep_state, State};
+draining({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+    {keep_state, State, [{reply, From, EK =/= undefined}]};
+draining({call, From}, early_data_accepted, #state{early_data_accepted = EDA} = State) ->
+    {keep_state, State, [{reply, From, EDA}]};
 draining(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, draining, State).
 
@@ -2296,6 +2342,10 @@ closed(enter, _OldState, State) ->
     {stop, normal, State};
 closed({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {closed, state_to_map(State)}}]};
+closed({call, From}, has_early_keys, #state{early_keys = EK} = State) ->
+    {keep_state, State, [{reply, From, EK =/= undefined}]};
+closed({call, From}, early_data_accepted, #state{early_data_accepted = EDA} = State) ->
+    {keep_state, State, [{reply, From, EDA}]};
 closed(_EventType, _EventContent, State) ->
     {keep_state, State}.
 
@@ -5030,6 +5080,9 @@ process_tls_message(
             %% RFC 8446 §4.1.4 group negotiation: use the client's
             %% key_share directly when possible, otherwise send a
             %% HelloRetryRequest for a mutually-supported group.
+            %% do_server_client_hello/6 carries the full PSK/0-RTT path
+            %% (external PSK, resumption binder verification, single-use
+            %% ticket consumption) once the group is settled.
             SupportedGroups = maps:get(supported_groups, ClientHelloInfo, []),
             case
                 select_key_share_group(
@@ -5174,16 +5227,29 @@ process_tls_message(
         end,
 
     case quic_tls:parse_encrypted_extensions(Body) of
-        {ok, #{alpn := Alpn, transport_params := TP}} ->
+        {ok, #{alpn := Alpn, transport_params := TP, early_data := EarlyDataInEE}} ->
+            %% RFC 9001 §4.6.2: a client that offered 0-RTT (i.e. has
+            %% derived early_keys from a session ticket) confirms
+            %% acceptance by the presence of the empty `early_data'
+            %% extension in EncryptedExtensions. Absence is rejection.
+            %% Clients that did not offer 0-RTT keep the default `false'.
+            OfferedZeroRtt = State#state.early_keys =/= undefined,
+            EarlyDataAccepted = OfferedZeroRtt andalso EarlyDataInEE,
             State0 = State#state{
                 tls_state = NextState,
                 tls_transcript = Transcript,
-                alpn = Alpn
+                alpn = Alpn,
+                early_data_accepted = EarlyDataAccepted
             },
             %% Apply peer transport params (extracts active_connection_id_limit).
             %% Client already has handshake keys at this point, so the CLOSE
             %% (if any) can be emitted immediately.
-            maybe_emit_pending_close(apply_peer_transport_params(TP, State0));
+            State1 = maybe_emit_pending_close(apply_peer_transport_params(TP, State0)),
+            %% Finalise 0-RTT bookkeeping: if the client offered 0-RTT and
+            %% the server did NOT accept, reset every stream that carried
+            %% 0-RTT data and notify the owner so the application protocol
+            %% can re-issue the affected requests.
+            finalize_zero_rtt_state(State1);
         _ ->
             State#state{
                 tls_state = NextState,
@@ -7508,10 +7574,14 @@ do_send_zero_rtt_data(
                 send_done = Fin orelse StreamState#stream_state.send_done
             },
             EarlyDataSent = State#state.early_data_sent + byte_size(DataBin),
+            NewZeroRttIds = sets:add_element(
+                StreamId, State#state.zero_rtt_stream_ids
+            ),
 
             FinalState0 = NewState#state{
                 streams = maps:put(StreamId, NewStreamState, Streams),
-                early_data_sent = EarlyDataSent
+                early_data_sent = EarlyDataSent,
+                zero_rtt_stream_ids = NewZeroRttIds
             },
             %% RFC 9000 §4.6: extend MAX_STREAMS once this stream is fully
             %% closed (covers the rare 0-RTT FIN-from-server case).
@@ -7565,6 +7635,48 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
         packets_sent = State#state.packets_sent + 1,
         socket_state = NewSocketState
     }.
+
+%% Reset local state for all streams that carried 0-RTT data when the
+%% server rejected 0-RTT. Drops the affected entries from the per-conn
+%% `streams' map and emits a single batched event to the owner so the
+%% application protocol (e.g. HTTP/3) can re-issue the affected requests.
+%% RFC 9001 §4.6.2. No RESET_STREAM frame is sent on the wire because
+%% the server never accepted these streams; both sides discard locally.
+%% Connection-level flow-control accounting is left untouched: 0-RTT
+%% bytes were sent under the resumed limits, and the new 1-RTT keys
+%% bring fresh `initial_max_data' / `initial_max_stream_data_*'
+%% allowances from the server's transport parameters.
+-spec reset_zero_rtt_streams([non_neg_integer()], #state{}) -> #state{}.
+reset_zero_rtt_streams([], State) ->
+    State;
+reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = State) ->
+    NewStreams = lists:foldl(fun maps:remove/2, Streams, RejectedIds),
+    ?LOG_INFO(
+        #{
+            what => zero_rtt_rejected,
+            rejected_stream_ids => RejectedIds,
+            count => length(RejectedIds)
+        },
+        ?QUIC_LOG_META
+    ),
+    Owner ! {quic, self(), {early_data_rejected, RejectedIds}},
+    State#state{
+        streams = NewStreams,
+        zero_rtt_stream_ids = sets:new([{version, 2}])
+    }.
+
+%% Branch on early_data_accepted at handshake completion: when 0-RTT
+%% was rejected, reset stream state for every stream that carried
+%% 0-RTT data; when accepted, leave the state untouched.
+%% RFC 9001 §4.6.2.
+-spec finalize_zero_rtt_state(#state{}) -> #state{}.
+finalize_zero_rtt_state(#state{early_data_accepted = true} = State) ->
+    State;
+finalize_zero_rtt_state(#state{early_data_accepted = false} = State) ->
+    case sets:to_list(State#state.zero_rtt_stream_ids) of
+        [] -> State;
+        RejectedIds -> reset_zero_rtt_streams(RejectedIds, State)
+    end.
 
 %% Estimate packet overhead (header + AEAD tag + frame header).
 %% Kept as a macro for the stream-chunking paths that sized themselves
@@ -11027,4 +11139,86 @@ test_maybe_send_ack_app(Trigger, State) ->
     sequential | reordered.
 test_classify_recv_trigger(PN, LargestRecv) ->
     classify_recv_trigger(PN, #pn_space{largest_recv = LargestRecv}).
+
+%% Build a minimal #state{} for 0-RTT rejection unit tests
+%% (RFC 9001 §4.6.2). `ZeroRttIds' seeds the tracking set, `Streams'
+%% pre-populates the stream map (values are opaque to the helper logic).
+-spec test_state_for_zero_rtt_reset(
+    pid(),
+    #{non_neg_integer() => term()},
+    [non_neg_integer()]
+) -> #state{}.
+test_state_for_zero_rtt_reset(Owner, Streams, ZeroRttIds) ->
+    #state{
+        owner = Owner,
+        streams = Streams,
+        zero_rtt_stream_ids = sets:from_list(ZeroRttIds, [{version, 2}])
+    }.
+
+%% Surface the relevant fields of #state{} as a plain map so test code
+%% can inspect them without depending on the internal record shape.
+-spec test_zero_rtt_reset_info(#state{}) ->
+    #{
+        streams := #{non_neg_integer() => term()},
+        zero_rtt_stream_ids := [non_neg_integer()]
+    }.
+test_zero_rtt_reset_info(#state{streams = Streams, zero_rtt_stream_ids = Ids}) ->
+    #{
+        streams => Streams,
+        zero_rtt_stream_ids => lists:sort(sets:to_list(Ids))
+    }.
+
+%% Drive the handshake-completion branch in isolation: set
+%% `early_data_accepted' and invoke the same finalisation logic the
+%% real handshake path uses.
+-spec test_finalize_zero_rtt_handshake(#state{}, boolean()) -> #state{}.
+test_finalize_zero_rtt_handshake(State, Accepted) ->
+    finalize_zero_rtt_state(State#state{early_data_accepted = Accepted}).
+
+%% Test-only wrapper around the internal `reset_zero_rtt_streams/2'.
+%% Keeps the API surface private (the function takes a `#state{}'
+%% record that no out-of-module caller can construct) while still
+%% giving tests direct access.
+-spec test_reset_zero_rtt_streams([non_neg_integer()], #state{}) -> #state{}.
+test_reset_zero_rtt_streams(RejectedIds, State) ->
+    reset_zero_rtt_streams(RejectedIds, State).
+
+%% Build a minimal client-side `#state{}' suitable for driving the
+%% TLS_ENCRYPTED_EXTENSIONS handler. When `OfferedZeroRtt' is true,
+%% `early_keys' is populated with a placeholder marker so the EE-handler
+%% recognises that 0-RTT was actually offered by this client.
+-spec test_client_state_for_ee(
+    pid(),
+    #{non_neg_integer() => term()},
+    [non_neg_integer()],
+    boolean()
+) -> #state{}.
+test_client_state_for_ee(Owner, Streams, ZeroRttIds, OfferedZeroRtt) ->
+    EarlyKeys =
+        case OfferedZeroRtt of
+            true ->
+                {
+                    #crypto_keys{
+                        key = <<0:128>>, iv = <<0:96>>, hp = <<0:128>>, cipher = aes_128_gcm
+                    },
+                    <<0:256>>
+                };
+            false ->
+                undefined
+        end,
+    #state{
+        role = client,
+        owner = Owner,
+        streams = Streams,
+        zero_rtt_stream_ids = sets:from_list(ZeroRttIds, [{version, 2}]),
+        early_keys = EarlyKeys,
+        tls_state = ?TLS_AWAITING_ENCRYPTED_EXT,
+        tls_transcript = <<>>
+    }.
+
+%% Drive the client-side EncryptedExtensions handler directly with a
+%% pre-built EE body. Returns the resulting `#state{}'.
+-spec test_process_encrypted_extensions(#state{}, binary()) -> #state{}.
+test_process_encrypted_extensions(State, Body) ->
+    process_tls_message(handshake, ?TLS_ENCRYPTED_EXTENSIONS, Body, Body, State).
 -endif.

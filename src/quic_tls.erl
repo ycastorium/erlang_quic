@@ -496,8 +496,12 @@ parse_server_hello(_) ->
     {error, invalid_server_hello}.
 
 %% @doc Parse EncryptedExtensions message.
+%% The `early_data' field signals whether the server accepted 0-RTT by
+%% echoing an empty `early_data' extension (RFC 8446 §4.2.10, RFC 9001
+%% §4.6.2). Presence is the entire signal; the extension body is empty
+%% on the EE path.
 -spec parse_encrypted_extensions(binary()) ->
-    {ok, #{alpn => binary(), transport_params => map()}}
+    {ok, #{alpn => binary(), transport_params => map(), early_data => boolean()}}
     | {error, term()}.
 parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, _Rest/binary>>) ->
     case parse_extensions(Extensions) of
@@ -519,7 +523,12 @@ parse_encrypted_extensions(<<ExtensionsLen:16, Extensions:ExtensionsLen/binary, 
                     _ ->
                         #{}
                 end,
-            {ok, #{alpn => Alpn, transport_params => TransportParams}};
+            EarlyData = maps:is_key(?EXT_EARLY_DATA, ExtMap),
+            {ok, #{
+                alpn => Alpn,
+                transport_params => TransportParams,
+                early_data => EarlyData
+            }};
         Error ->
             Error
     end;
