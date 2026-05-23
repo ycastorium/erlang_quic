@@ -6,6 +6,9 @@
 - [x] Connection establishment with TLS 1.3 handshake
 - [x] Connection close (immediate and draining states)
 - [x] Idle timeout enforcement (configurable via `idle_timeout` option)
+- [x] Lazy idle and keep-alive timers: armed once and re-armed only when they
+  fire, using the `last_activity` timestamp, so steady-state traffic does not
+  cancel and reschedule a timer on every packet
 - [x] Version negotiation
 - [x] Retry packets for address validation
 - [x] Latency spin bit (RFC 9000 §17.4) with `spin_bit => true | false`
@@ -32,6 +35,9 @@
 - [x] Packet number reconstruction per RFC 9000 Appendix A
 - [x] Coalesced packets
 - [x] Frame coalescing (ACK + small stream data in single packet)
+- [x] HTTP/3 response HEADERS coalesced with the first DATA frame so the
+  response headers and first body bytes ride in one 1-RTT packet (a large
+  body still fragments; only the standalone HEADERS packet is removed)
 
 ### Connection Migration (RFC 9000 Section 9)
 - [x] PATH_CHALLENGE / PATH_RESPONSE validation
