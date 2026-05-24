@@ -181,9 +181,14 @@ encode(Headers, State) ->
     %% >= RIC, so per Section 4.5.1.2 the Sign bit is 0 and DeltaBase =
     %% BaseIC - RIC. A static-only section has BaseIC = RIC = 0, giving the
     %% two prefix bytes 00 00.
-    RICEncoded = encode_ric(RIC, State#qpack.dyn_max_size),
+    %% Both fields are prefix integers (Section 4.5.1.1: 8-bit prefix for the
+    %% Required Insert Count, 7-bit for Delta Base). Encoding them as raw bytes
+    %% silently corrupts the section once a value reaches the prefix maximum
+    %% (e.g. an encoded insert count of 255 on a long-lived dynamic table),
+    %% because the decoder then reads a continuation byte that was never sent.
+    RICEncoded = encode_prefixed_int(encode_ric(RIC, State#qpack.dyn_max_size), 8, 0),
     BaseEncoded = encode_prefixed_int(BaseIC - RIC, 7, 0),
-    Prefix = <<RICEncoded, BaseEncoded/binary>>,
+    Prefix = <<RICEncoded/binary, BaseEncoded/binary>>,
 
     {<<Prefix/binary, EncodedHeaders/binary>>, NewState#qpack{last_ric = RIC}}.
 

@@ -279,6 +279,34 @@ dynamic_blocked_stream_recovery_test() ->
     {ok, D1} = quic_qpack:process_encoder_instructions(Instr, D0),
     ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, D1))).
 
+%% A Required Insert Count whose encoded value reaches 255 must use the
+%% 8-bit prefix-integer continuation encoding (RFC 9204 Section 4.5.1.1);
+%% packing it as a raw byte truncated the prefix and silently dropped the
+%% section. Insert 254 entries, then reference entry 253 (RIC = 254 ->
+%% encoded insert count 255).
+dynamic_large_insert_count_roundtrip_test() ->
+    Cap = 4096,
+    E0 = quic_qpack:new(#{max_dynamic_size => Cap}),
+    D0 = quic_qpack:new(#{max_dynamic_size => Cap}),
+    {Ef, Df} = lists:foldl(
+        fun(I, {E, D}) ->
+            H = [{<<"h", (integer_to_binary(I))/binary>>, <<"v">>}],
+            {_, E1} = quic_qpack:encode(H, I, E),
+            {ok, D1} = quic_qpack:process_encoder_instructions(
+                quic_qpack:get_encoder_instructions(E1), D
+            ),
+            {quic_qpack:clear_encoder_instructions(E1), D1}
+        end,
+        {E0, D0},
+        lists:seq(0, 253)
+    ),
+    {ok, Eack} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(254), Ef
+    ),
+    H = [{<<"h253">>, <<"v">>}],
+    {Ref, _E} = quic_qpack:encode(H, 999, Eack),
+    ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, Df))).
+
 %%====================================================================
 %% Huffman Encoding Tests
 %%====================================================================
