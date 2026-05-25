@@ -132,19 +132,45 @@ encode_response_headers_bytes_test() ->
 
 decode_base_sign_zero_test() ->
     %% S=0: Base = Required Insert Count + Delta Base.
-    ?assertEqual(13, quic_qpack:decode_base(0, 10, 3)).
+    ?assertEqual(13, quic_qpack_prefix:decode_base(0, 10, 3)).
 
 decode_base_sign_one_test() ->
     %% S=1: Base = Required Insert Count - Delta Base - 1.
-    ?assertEqual(6, quic_qpack:decode_base(1, 10, 3)).
+    ?assertEqual(6, quic_qpack_prefix:decode_base(1, 10, 3)).
 
 decode_base_static_only_test() ->
     %% Static-only prefix (00 00): RIC=0, S=0, DeltaBase=0 -> Base=0.
-    ?assertEqual(0, quic_qpack:decode_base(0, 0, 0)).
+    ?assertEqual(0, quic_qpack_prefix:decode_base(0, 0, 0)).
 
 decode_base_sign_one_boundary_test() ->
     %% S=1 with DeltaBase=0 -> Base = RIC - 1.
-    ?assertEqual(4, quic_qpack:decode_base(1, 5, 0)).
+    ?assertEqual(4, quic_qpack_prefix:decode_base(1, 5, 0)).
+
+%%====================================================================
+%% Required Insert Count reconstruction (RFC 9204 Section 4.5.1.1)
+%%
+%%   EncInsertCount = 0 -> RIC = 0
+%%   else MaxValue   = TotalInserts + MaxEntries
+%%        MaxWrapped = floor(MaxValue / 2*MaxEntries) * 2*MaxEntries
+%%        RIC        = MaxWrapped + EncInsertCount - 1  (wrap if > MaxValue)
+%%====================================================================
+
+decode_ric_zero_test() ->
+    %% EncInsertCount 0 decodes to 0 regardless of table state.
+    ?assertEqual(0, quic_qpack_prefix:decode_ric(0, 128, 1000)).
+
+decode_ric_no_wrap_test() ->
+    %% MaxEntries=128: RIC=1 encodes as (1 rem 256)+1 = 2.
+    ?assertEqual(1, quic_qpack_prefix:decode_ric(2, 128, 1)).
+
+decode_ric_no_wrap_large_test() ->
+    %% RIC=100 encodes as (100 rem 256)+1 = 101.
+    ?assertEqual(100, quic_qpack_prefix:decode_ric(101, 128, 100)).
+
+decode_ric_wraparound_test() ->
+    %% MaxEntries=2 (FullRange 4), TotalInserts=10: EncInsertCount 2 wraps
+    %% back to RIC=9 ((9 rem 4)+1 = 2).
+    ?assertEqual(9, quic_qpack_prefix:decode_ric(2, 2, 10)).
 
 %%====================================================================
 %% Literal Header Tests
