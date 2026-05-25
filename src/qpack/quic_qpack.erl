@@ -71,11 +71,6 @@
     encode_stream_cancel/1
 ]).
 
-%% Exported for unit tests only.
--ifdef(TEST).
--export([decode_base/3]).
--endif.
-
 %%====================================================================
 %% Types
 %%====================================================================
@@ -786,35 +781,10 @@ decode_prefix(Data, State) ->
                 end,
             %% Reconstruct RIC using modulo arithmetic
             MaxEntries = max(1, State#qpack.dyn_max_size div ?ENTRY_OVERHEAD),
-            RIC = decode_ric(ERIC, MaxEntries, State#qpack.insert_count),
+            RIC = quic_qpack_prefix:decode_ric(ERIC, MaxEntries, State#qpack.insert_count),
             %% Reconstruct Base per RFC 9204 Section 4.5.1.2.
-            Base = decode_base(SBit, RIC, DeltaBase),
+            Base = quic_qpack_prefix:decode_base(SBit, RIC, DeltaBase),
             {{RIC, Base}, Rest2}
-    end.
-
-%% Reconstruct the Base from the field section prefix Sign bit and Delta
-%% Base (RFC 9204 Section 4.5.1.2):
-%%   S=0 -> Base = ReqInsertCount + DeltaBase     (Base >= Required Insert Count)
-%%   S=1 -> Base = ReqInsertCount - DeltaBase - 1  (Base < Required Insert Count)
--spec decode_base(0 | 1, non_neg_integer(), non_neg_integer()) -> integer().
-decode_base(0, RIC, DeltaBase) ->
-    RIC + DeltaBase;
-decode_base(1, RIC, DeltaBase) ->
-    RIC - DeltaBase - 1.
-
-%% Decode Required Insert Count per RFC 9204 Section 4.5.1.1
--spec decode_ric(non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
-    non_neg_integer().
-decode_ric(0, _MaxEntries, _TotalInsertCount) ->
-    0;
-decode_ric(ERIC, MaxEntries, TotalInsertCount) ->
-    FullRange = 2 * MaxEntries,
-    MaxValue = TotalInsertCount + MaxEntries,
-    MaxWrapped = (MaxValue div FullRange) * FullRange,
-    RIC = MaxWrapped + ERIC - 1,
-    case RIC > MaxValue of
-        true -> RIC - FullRange;
-        false -> RIC
     end.
 
 %% Decode headers with Required Insert Count (RIC) and Base from prefix
