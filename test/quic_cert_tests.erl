@@ -186,6 +186,39 @@ amp_setup() ->
     end.
 
 %%====================================================================
+%% Retry address validation (RFC 9000 8.1.2): with
+%% address_validation => always the server sends a Retry and the
+%% handshake must complete once the client echoes the token. (This used
+%% to loop forever because the token's ODCID was matched against the
+%% retried Initial's DCID.)
+%%====================================================================
+
+retry_address_validation_test_() ->
+    {setup, fun retry_setup/0, fun cleanup/1, fun(Ctx) ->
+        case Ctx of
+            skip ->
+                [];
+            #{port := Port} ->
+                [
+                    {"address_validation=always completes via a Retry round-trip",
+                        {timeout, 30, ?_assertEqual(connected, connect(Port, #{verify => false}))}}
+                ]
+        end
+    end}.
+
+retry_setup() ->
+    case gen_cert("/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1") of
+        {ok, Cert, Key} ->
+            {ok, _} = application:ensure_all_started(quic),
+            {ok, Server} = quic_test_echo_server:start(#{
+                cert => Cert, key => Key, address_validation => always
+            }),
+            (maps:merge(#{cert => Cert}, Server))#{server => Server};
+        {error, _} ->
+            skip
+    end.
+
+%%====================================================================
 %% HTTP/3 client inherits the same verification
 %%====================================================================
 

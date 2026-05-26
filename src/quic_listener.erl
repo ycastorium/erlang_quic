@@ -745,18 +745,24 @@ create_connection(
             ),
             send_packet(Socket, SocketState, Backend, IP, Port, RetryPacket),
             ok;
-        Verdict when Verdict =:= spawn_validated orelse Verdict =:= spawn_unvalidated ->
-            case connection_limit_reached(State) of
-                true ->
-                    %% Silently drop (no reply) to avoid amplification; the
-                    %% client retries or times out.
-                    ?LOG_WARNING(#{what => connection_limit_reached}, ?QUIC_LOG_META),
-                    ok;
-                false ->
-                    create_connection_unconditional(
-                        Verdict, Packet, DCID, Version, RemoteAddr, State
-                    )
-            end
+        spawn_unvalidated ->
+            %% No Retry: the client's DCID is the original; no retry SCID.
+            spawn_with_limit(false, DCID, undefined, Packet, DCID, Version, RemoteAddr, State);
+        {spawn_validated, OrigDCID, RetrySCID} ->
+            spawn_with_limit(true, OrigDCID, RetrySCID, Packet, DCID, Version, RemoteAddr, State)
+    end.
+
+spawn_with_limit(Validated, OrigDCID, RetrySCID, Packet, DCID, Version, RemoteAddr, State) ->
+    case connection_limit_reached(State) of
+        true ->
+            %% Silently drop (no reply) to avoid amplification; the client
+            %% retries or times out.
+            ?LOG_WARNING(#{what => connection_limit_reached}, ?QUIC_LOG_META),
+            ok;
+        false ->
+            create_connection_unconditional(
+                Validated, OrigDCID, RetrySCID, Packet, DCID, Version, RemoteAddr, State
+            )
     end.
 
 %% Optional cap on concurrent connections (`max_connections' option,
@@ -771,7 +777,9 @@ connection_limit_reached(#listener_state{connections = Conns, opts = Opts}) ->
     end.
 
 create_connection_unconditional(
-    Verdict,
+    Validated,
+    OrigDCID,
+    RetrySCID,
     Packet,
     DCID,
     Version,
@@ -822,6 +830,9 @@ create_connection_unconditional(
         listener_gso_supported => ListenerGSO,
         remote_addr => RemoteAddr,
         initial_dcid => DCID,
+        %% original_destination_connection_id transport param: the client's
+        %% DCID before any Retry. Equals DCID when no Retry occurred.
+        original_dcid => OrigDCID,
         scid => ServerCID,
         cert => Cert,
         cert_chain => CertChain,
@@ -832,20 +843,13 @@ create_connection_unconditional(
         listener => self(),
         cid_config => CIDConfig,
         reset_secret => ResetSecret,
-        %% For Verdict = spawn_validated the listener already checked
-        %% the client's retry token; skip the per-connection
-        %% re-validation to avoid redundant work.
-        address_validated => (Verdict =:= spawn_validated),
-        %% When spawn_validated is reached, the DCID on the accepted
-        %% Initial is the SCID the listener issued in its Retry
-        %% (RFC 9000 §7.3 client behaviour). Echo it back to the
-        %% client as retry_source_connection_id in our transport
-        %% parameters.
-        retry_scid =>
-            case Verdict of
-                spawn_validated -> DCID;
-                _ -> undefined
-            end,
+        %% The listener already validated the client's token (if any);
+        %% skip the per-connection re-validation.
+        address_validated => Validated,
+        %% retry_source_connection_id (RFC 9000 §7.3): the SCID we put in
+        %% the Retry, which is the DCID on this Initial. `undefined' when
+        %% no Retry occurred (fresh connection or NEW_TOKEN).
+        retry_scid => RetrySCID,
         version => Version
     },
 
@@ -968,13 +972,20 @@ decide_address_validation(Packet, _Version, Addr, Secret, always, MaxAge) ->
                 Secret, Addr, ODCID, erlang:system_time(millisecond)
             ),
             {send_retry, ClientSCID, Token};
-        {ok, Token, ClientSCID, ExpectedODCID} ->
-            case validate_initial_token(Secret, Token, Addr, ExpectedODCID, MaxAge) of
-                ok ->
-                    spawn_validated;
+        {ok, Token, ClientSCID, RetriedDCID} ->
+            case validate_initial_token(Secret, Token, Addr, MaxAge) of
+                {ok, #{kind := retry, odcid := OrigDCID}} ->
+                    %% A Retry happened: the original DCID comes from the
+                    %% token (RFC 9000 §7.3), and the Initial's DCID is the
+                    %% RetrySCID we issued.
+                    {spawn_validated, OrigDCID, RetriedDCID};
+                {ok, #{kind := new_token}} ->
+                    %% NEW_TOKEN from a prior session, no Retry: the
+                    %% Initial's DCID is the original; no retry SCID.
+                    {spawn_validated, RetriedDCID, undefined};
                 {error, _} ->
                     Fresh = quic_address_token:encode_retry(
-                        Secret, Addr, ExpectedODCID, erlang:system_time(millisecond)
+                        Secret, Addr, RetriedDCID, erlang:system_time(millisecond)
                     ),
                     {send_retry, ClientSCID, Fresh}
             end;
@@ -1003,10 +1014,13 @@ parse_initial_token(
 parse_initial_token(_) ->
     {error, not_initial}.
 
-validate_initial_token(Secret, Token, Addr, ExpectedODCID, MaxAge) ->
+validate_initial_token(Secret, Token, Addr, MaxAge) ->
     case quic_address_token:decode(Secret, Token) of
         {ok, #{addr := TokAddr} = Decoded} when TokAddr =:= Addr ->
-            quic_address_token:validate(Decoded, ExpectedODCID, #{max_age_ms => MaxAge});
+            case quic_address_token:validate(Decoded, #{max_age_ms => MaxAge}) of
+                ok -> {ok, Decoded};
+                {error, _} = Err -> Err
+            end;
         {ok, _} ->
             {error, address_mismatch};
         {error, _} = Err ->

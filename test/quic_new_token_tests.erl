@@ -74,16 +74,16 @@ server_rejects_expired_retry_token_test() ->
         quic_connection:maybe_validate_initial_token(Token, S)
     ).
 
-server_rejects_retry_with_mismatched_odcid_test() ->
+%% RFC 9000 §7.3: the retry token carries the original DCID for the
+%% transport param; it is not matched against the connection's DCID, so a
+%% valid token is accepted even when they differ.
+server_accepts_retry_token_regardless_of_odcid_test() ->
     Addr = {{127, 0, 0, 1}, 4433},
     Token = quic_address_token:encode_retry(
         secret(), Addr, <<1, 2, 3>>, erlang:system_time(millisecond)
     ),
     S = quic_connection:test_state_for_server(Addr, secret(), <<9, 9, 9>>),
-    ?assertEqual(
-        {error, odcid_mismatch},
-        quic_connection:maybe_validate_initial_token(Token, S)
-    ).
+    ?assertEqual(validated, quic_connection:maybe_validate_initial_token(Token, S)).
 
 server_without_secret_skips_validation_test() ->
     Addr = {{127, 0, 0, 1}, 4433},

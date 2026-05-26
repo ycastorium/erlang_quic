@@ -18,7 +18,7 @@
     encode_retry/4,
     encode_new_token/3,
     decode/2,
-    validate/3
+    validate/2
 ]).
 
 -type addr() :: {inet:ip_address(), inet:port_number()}.
@@ -73,9 +73,11 @@ do_decode(_Secret, Token) when byte_size(Token) < ?HMAC_LEN + 12 ->
 do_decode(Secret, Token) ->
     BodyLen = byte_size(Token) - ?HMAC_LEN,
     <<Body:BodyLen/binary, Sig:?HMAC_LEN/binary>> = Token,
-    case sign(Secret, Body) of
-        Sig -> parse_body(Body);
-        _ -> {error, signature_mismatch}
+    %% Constant-time compare: the HMAC is the only thing preventing token
+    %% forgery, so don't leak a byte-position oracle.
+    case crypto:hash_equals(sign(Secret, Body), Sig) of
+        true -> parse_body(Body);
+        false -> {error, signature_mismatch}
     end.
 
 parse_body(<<?KIND_RETRY, Rest/binary>>) ->
@@ -87,37 +89,37 @@ parse_body(<<?KIND_NEW_TOKEN, Rest/binary>>) ->
     <<Ts:64>> = Rest1,
     {ok, #{kind => new_token, addr => Addr, ts => Ts, odcid => undefined}}.
 
-%% @doc Validate a decoded token. Requires signature to match, the
-%% timestamp to be within `max_age_ms' of now, and — for the retry
-%% kind — the ODCID to match `ExpectedODCID'. Address is checked by
-%% the listener against the current source (not verified here).
--spec validate(map(), binary(), #{max_age_ms => non_neg_integer()}) ->
-    ok | {error, term()}.
-validate(#{ts := Ts, kind := Kind, odcid := ODCID}, ExpectedODCID, Opts) ->
+%% @doc Validate a decoded token: the signature must match (checked in
+%% decode/2) and the timestamp must be within `max_age_ms' of now. The
+%% address is checked by the listener against the current source. The
+%% retry token's ODCID is NOT compared here — it carries the client's
+%% original DCID so the server can recover it for the
+%% original_destination_connection_id transport param (RFC 9000 §7.3),
+%% not to be matched against the retried Initial's DCID.
+-spec validate(map(), #{max_age_ms => non_neg_integer()}) -> ok | {error, term()}.
+validate(#{ts := Ts}, Opts) ->
     MaxAgeMs = maps:get(max_age_ms, Opts, ?DEFAULT_MAX_AGE_MS),
     NowMs = erlang:system_time(millisecond),
     Age = NowMs - Ts,
-    case check_age(Age, MaxAgeMs) of
-        ok -> check_odcid(Kind, ODCID, ExpectedODCID);
-        {error, _} = Err -> Err
-    end.
+    check_age(Age, MaxAgeMs).
 
 check_age(Age, _) when Age < 0 -> {error, token_from_future};
 check_age(Age, MaxAgeMs) when Age > MaxAgeMs -> {error, token_expired};
 check_age(_, _) -> ok.
-
-check_odcid(retry, ODCID, ExpectedODCID) when ODCID =/= ExpectedODCID ->
-    {error, odcid_mismatch};
-check_odcid(_, _, _) ->
-    ok.
 
 %%====================================================================
 %% Internal
 %%====================================================================
 
 sign(Secret, Body) ->
-    <<Sig:?HMAC_LEN/binary, _/binary>> = crypto:mac(hmac, sha256, Secret, Body),
+    <<Sig:?HMAC_LEN/binary, _/binary>> = crypto:mac(hmac, sha256, token_key(Secret), Body),
     Sig.
+
+%% Domain-separate the address-token key from the stateless-reset-token
+%% key, which share the same server secret. Derived internally so all
+%% encode/decode paths stay consistent without changing callers.
+token_key(Secret) ->
+    crypto:mac(hmac, sha256, Secret, <<"quic address validation token v1">>).
 
 encode_addr({{A, B, C, D}, Port}) ->
     <<4:8, A:8, B:8, C:8, D:8, Port:16>>;

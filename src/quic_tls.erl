@@ -640,6 +640,8 @@ encode_transport_param(active_connection_id_limit, Value) ->
     encode_tp(?TP_ACTIVE_CONNECTION_ID_LIMIT, quic_varint:encode(Value));
 encode_transport_param(initial_scid, Value) ->
     encode_tp(?TP_INITIAL_SCID, Value);
+encode_transport_param(retry_scid, Value) ->
+    encode_tp(?TP_RETRY_SCID, Value);
 encode_transport_param(preferred_address, #preferred_address{} = PA) ->
     encode_tp(?TP_PREFERRED_ADDRESS, encode_preferred_address(PA));
 encode_transport_param(max_datagram_frame_size, Value) when Value > 0 ->

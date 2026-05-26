@@ -18,14 +18,14 @@ retry_roundtrip_test() ->
     ?assertEqual(retry, maps:get(kind, Decoded)),
     ?assertEqual(Addr, maps:get(addr, Decoded)),
     ?assertEqual(ODCID, maps:get(odcid, Decoded)),
-    ?assertEqual(ok, quic_address_token:validate(Decoded, ODCID, #{})).
+    ?assertEqual(ok, quic_address_token:validate(Decoded, #{})).
 
 new_token_roundtrip_test() ->
     Addr = {{10, 0, 0, 42}, 443},
     Token = quic_address_token:encode_new_token(secret(), Addr, now_ms()),
     {ok, Decoded} = quic_address_token:decode(secret(), Token),
     ?assertEqual(new_token, maps:get(kind, Decoded)),
-    ?assertEqual(ok, quic_address_token:validate(Decoded, <<>>, #{})).
+    ?assertEqual(ok, quic_address_token:validate(Decoded, #{})).
 
 ipv6_roundtrip_test() ->
     Addr = {{0, 0, 0, 0, 0, 0, 0, 1}, 4433},
@@ -46,18 +46,18 @@ expired_token_rejected_test() ->
     Long = now_ms() - 60 * 60 * 1000,
     Token = quic_address_token:encode_new_token(secret(), Addr, Long),
     {ok, Decoded} = quic_address_token:decode(secret(), Token),
-    ?assertMatch({error, token_expired}, quic_address_token:validate(Decoded, <<>>, #{})).
+    ?assertMatch({error, token_expired}, quic_address_token:validate(Decoded, #{})).
 
-odcid_mismatch_rejected_test() ->
+%% The retry token carries the original DCID for the
+%% original_destination_connection_id transport param; validate/2 does
+%% not compare it (RFC 9000 §7.3), it is read from the decoded token.
+odcid_is_carried_not_compared_test() ->
     Addr = {{127, 0, 0, 1}, 4433},
-    Token = quic_address_token:encode_retry(
-        secret(), Addr, <<1, 2, 3, 4>>, now_ms()
-    ),
+    ODCID = <<1, 2, 3, 4>>,
+    Token = quic_address_token:encode_retry(secret(), Addr, ODCID, now_ms()),
     {ok, Decoded} = quic_address_token:decode(secret(), Token),
-    ?assertMatch(
-        {error, odcid_mismatch},
-        quic_address_token:validate(Decoded, <<9, 9, 9, 9>>, #{})
-    ).
+    ?assertEqual(ODCID, maps:get(odcid, Decoded)),
+    ?assertEqual(ok, quic_address_token:validate(Decoded, #{})).
 
 malformed_token_rejected_test() ->
     ?assertMatch({error, _}, quic_address_token:decode(secret(), <<"too short">>)).

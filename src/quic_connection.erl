@@ -1037,7 +1037,9 @@ init({server, Opts}) ->
         scid = SCID,
         % Will be set from ClientHello SCID
         dcid = <<>>,
-        original_dcid = InitialDCID,
+        %% Defaults to the Initial's DCID; the listener overrides it with
+        %% the pre-Retry DCID (from the token) for a retried connection.
+        original_dcid = maps:get(original_dcid, Opts, InitialDCID),
         role = server,
         % Use client's QUIC version
         version = Version,
@@ -2812,7 +2814,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     TransportParams =
         case State#state.retry_scid_for_tp of
             undefined -> TransportParams3;
-            RetrySCIDTP -> TransportParams3#{retry_source_connection_id => RetrySCIDTP}
+            RetrySCIDTP -> TransportParams3#{retry_scid => RetrySCIDTP}
         end,
 
     %% Build EncryptedExtensions
@@ -3828,8 +3830,13 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
             <<>> ->
                 % First packet, set DCID
                 State#state{dcid = PeerSCID};
-            _ when State#state.dcid =:= State#state.original_dcid ->
-                % Client updates dcid after first server packet
+            _ when
+                State#state.dcid =:= State#state.original_dcid orelse
+                    State#state.dcid =:= State#state.retry_scid
+            ->
+                % Client adopts the server's SCID after the first server
+                % packet. After a Retry the DCID is the Retry's SCID rather
+                % than the original, so accept that case too.
                 State#state{dcid = PeerSCID};
             _ ->
                 % Already updated
@@ -4020,13 +4027,19 @@ check_stateless_reset(Data, #state{peer_cid_pool = PeerCIDs} = _State) ->
             {error, decryption_failed}
     end.
 
-%% Find if a token matches any known stateless reset token
+%% Find if a token matches any known stateless reset token. Compared in
+%% constant time: reset tokens are secret (RFC 9000 §10.3.1), so avoid a
+%% byte-position timing oracle.
 find_matching_reset_token(_Token, []) ->
     not_found;
-find_matching_reset_token(Token, [#cid_entry{stateless_reset_token = Token, cid = CID} | _]) ->
-    {ok, CID};
-find_matching_reset_token(Token, [_ | Rest]) ->
-    find_matching_reset_token(Token, Rest).
+find_matching_reset_token(Token, [#cid_entry{stateless_reset_token = Known, cid = CID} | Rest]) ->
+    case
+        is_binary(Known) andalso byte_size(Known) =:= byte_size(Token) andalso
+            crypto:hash_equals(Token, Known)
+    of
+        true -> {ok, CID};
+        false -> find_matching_reset_token(Token, Rest)
+    end.
 
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
@@ -10017,14 +10030,13 @@ maybe_validate_initial_token(_Token, #state{stateless_reset_secret = undefined})
     no_token;
 maybe_validate_initial_token(Token, #state{
     stateless_reset_secret = Secret,
-    remote_addr = Addr,
-    original_dcid = ODCID
+    remote_addr = Addr
 }) ->
     case quic_address_token:decode(Secret, Token) of
         {ok, #{addr := TokAddr} = Decoded} when TokAddr =/= Addr ->
             {error, address_mismatch, Decoded};
         {ok, Decoded} ->
-            case quic_address_token:validate(Decoded, ODCID, #{}) of
+            case quic_address_token:validate(Decoded, #{}) of
                 ok -> validated;
                 {error, Reason} -> {error, Reason}
             end;
