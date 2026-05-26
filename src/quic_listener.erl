@@ -725,9 +725,28 @@ create_connection(
             send_packet(Socket, SocketState, Backend, IP, Port, RetryPacket),
             ok;
         Verdict when Verdict =:= spawn_validated orelse Verdict =:= spawn_unvalidated ->
-            create_connection_unconditional(
-                Verdict, Packet, DCID, Version, RemoteAddr, State
-            )
+            case connection_limit_reached(State) of
+                true ->
+                    %% Silently drop (no reply) to avoid amplification; the
+                    %% client retries or times out.
+                    ?LOG_WARNING(#{what => connection_limit_reached}, ?QUIC_LOG_META),
+                    ok;
+                false ->
+                    create_connection_unconditional(
+                        Verdict, Packet, DCID, Version, RemoteAddr, State
+                    )
+            end
+    end.
+
+%% Optional cap on concurrent connections (`max_connections' option,
+%% default `infinity'). The routing table holds the DCID + server CID
+%% pair per connection, so size div 2 approximates the connection count.
+connection_limit_reached(#listener_state{connections = Conns, opts = Opts}) ->
+    case maps:get(max_connections, Opts, infinity) of
+        infinity ->
+            false;
+        Max when is_integer(Max) ->
+            (ets:info(Conns, size) div 2) >= Max
     end.
 
 create_connection_unconditional(
