@@ -176,3 +176,18 @@ decode_safe_valid_padding_test() ->
             <<"aaaaa">>
         ]
     ).
+
+%% RFC 7541 §5.2: decode_safe/1 must report errors, never crash.
+decode_safe_rejects_overlong_padding_test() ->
+    %% Whole input is all-ones padding (>= 8 bits).
+    ?assertMatch({error, _}, quic_qpack_huffman:decode_safe(<<16#FF>>)),
+    ?assertMatch({error, _}, quic_qpack_huffman:decode_safe(<<16#FF, 16#FF>>)).
+
+decode_safe_rejects_invalid_code_without_crashing_test() ->
+    %% 32 one-bits is an invalid encoding; must return {error,_}, not crash.
+    ?assertMatch({error, _}, quic_qpack_huffman:decode_safe(<<16#FF, 16#FF, 16#FF, 16#FF>>)).
+
+decode_safe_accepts_valid_and_empty_test() ->
+    ?assertEqual({ok, <<>>}, quic_qpack_huffman:decode_safe(<<>>)),
+    Enc = quic_qpack_huffman:encode(<<"hello">>),
+    ?assertEqual({ok, <<"hello">>}, quic_qpack_huffman:decode_safe(Enc)).

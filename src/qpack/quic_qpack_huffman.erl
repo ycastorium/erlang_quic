@@ -49,7 +49,15 @@ decode(Data) ->
 -spec decode_safe(binary()) -> {ok, binary()} | {error, term()}.
 decode_safe(Data) ->
     try
-        {ok, decode_validated(Data, byte_size(Data), 0, <<>>)}
+        Decoded = decode_validated(Data, byte_size(Data), 0, <<>>),
+        %% A non-empty Huffman string must decode to at least one symbol
+        %% (padding is only the <= 7 trailing bits after the last symbol).
+        %% An empty result from non-empty input means the whole input was
+        %% padding, which exceeds the 7-bit maximum (RFC 7541 §5.2).
+        case Data =/= <<>> andalso Decoded =:= <<>> of
+            true -> {error, invalid_padding};
+            false -> {ok, Decoded}
+        end
     catch
         throw:{huffman_error, Reason} -> {error, Reason}
     end.
@@ -123,8 +131,8 @@ decode(_Rest, 0, _, Acc) ->
 %% Validated decoding - same as decode/4 but validates EOS padding
 -spec decode_validated(binary(), non_neg_integer(), non_neg_integer(), binary()) -> binary().
 decode_validated(<<A:4, B:4, R/bits>>, Len, State0, Acc) when Len > 1 ->
-    {_, CharA, State1} = dec_huffman_lookup(State0, A),
-    {_, CharB, State} = dec_huffman_lookup(State1, B),
+    {_, CharA, State1} = lookup_or_fail(State0, A),
+    {_, CharB, State} = lookup_or_fail(State1, B),
     NewAcc =
         case {CharA, CharB} of
             {undefined, undefined} -> Acc;
@@ -134,8 +142,8 @@ decode_validated(<<A:4, B:4, R/bits>>, Len, State0, Acc) when Len > 1 ->
         end,
     decode_validated(R, Len - 1, State, NewAcc);
 decode_validated(<<A:4, B:4, _Rest/bits>>, 1, State0, Acc) ->
-    {_StatusA, CharA, State1} = dec_huffman_lookup(State0, A),
-    {StatusB, CharB, FinalState} = dec_huffman_lookup(State1, B),
+    {_StatusA, CharA, State1} = lookup_or_fail(State0, A),
+    {StatusB, CharB, FinalState} = lookup_or_fail(State1, B),
     %% Validate termination per RFC 7541 Section 5.2
     case StatusB of
         ok when FinalState =:= 16#00 ->
@@ -160,6 +168,15 @@ decode_validated(<<A:4, B:4, _Rest/bits>>, 1, State0, Acc) ->
     end;
 decode_validated(_Rest, 0, _, Acc) ->
     Acc.
+
+%% dec_huffman_lookup/2 returns the bare atom `error' on an invalid state
+%% transition; turn that into a thrown huffman_error so decode_safe/1
+%% reports {error, _} instead of crashing on a badmatch.
+lookup_or_fail(State, Nibble) ->
+    case dec_huffman_lookup(State, Nibble) of
+        error -> throw({huffman_error, invalid_code});
+        Result -> Result
+    end.
 
 %% Check if the padding nibble is valid EOS padding
 %% Valid padding must be the most-significant bits of EOS (all 1s)
