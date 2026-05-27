@@ -378,6 +378,13 @@ duplicate_setting_error_code_test() ->
 %% Trailer Pseudo-Header Validation Tests (RFC 9114 Section 4.1.2)
 %%====================================================================
 
+%% RFC 9114 §4.3: an undefined pseudo-header makes the request malformed.
+unknown_pseudo_header_rejected_test() ->
+    Stream = #h3_stream{id = 0},
+    Headers = [{<<":method">>, <<"GET">>}, {<<":foo">>, <<"bar">>}, {<<":path">>, <<"/">>}],
+    Result = quic_h3_connection:update_stream_with_headers(Headers, Stream, server, undefined),
+    ?assertEqual({error, {invalid_pseudo_header, <<":foo">>}}, Result).
+
 trailer_pseudo_header_rejected_test() ->
     %% Trailers with pseudo-headers must be rejected
     Stream = #h3_stream{id = 0, content_length = undefined},

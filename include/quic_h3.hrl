@@ -80,6 +80,11 @@
 %% when peers craft pathological Length varints (up to 2^62 - 1).
 -define(H3_MAX_FRAME_SIZE, 16#100000).
 
+%% Cap on a request body buffered at the H3 layer when no Content-Length
+%% bounds it. Flow control limits in-flight bytes, but a long stream whose
+%% data is consumed could otherwise grow this buffer without bound.
+-define(H3_MAX_BUFFERED_BODY, 16#1000000).
+
 %%====================================================================
 %% QPACK Error Codes (RFC 9204 Section 8.2)
 %%====================================================================

@@ -555,3 +555,12 @@ invalid_static_index_rejected_test() ->
     FieldLine = <<16#FF, 36>>,
     Block = <<Prefix/binary, FieldLine/binary>>,
     ?assertMatch({error, {invalid_static_index, _}}, quic_qpack:decode(Block)).
+
+%% RFC 7541 §5.2: an invalid Huffman-coded string in a short-length field
+%% value must be rejected. 32 one-bits is not a valid encoding. This
+%% exercises the short-length Huffman value path in decode_string, which
+%% previously used the non-validating decoder.
+short_huffman_invalid_rejected_test() ->
+    %% prefix(0,0) + literal-name "x" + Huffman value (len 4) of 0xFFFFFFFF.
+    Bad = <<0, 0, 16#21, "x", 16#84, 16#FF, 16#FF, 16#FF, 16#FF>>,
+    ?assertMatch({error, _}, quic_qpack:decode(Bad)).

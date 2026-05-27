@@ -2259,6 +2259,16 @@ handle_request_frame(
     Fin,
     #h3_stream{frame_state = expecting_data} = Stream,
     State
+) when (byte_size(Stream#h3_stream.body) + byte_size(Payload)) > ?H3_MAX_BUFFERED_BODY ->
+    %% Without a Content-Length the body buffer would otherwise grow with
+    %% the stream; cap it (RFC 9114 §4.1 allows H3_EXCESSIVE_LOAD).
+    {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
+handle_request_frame(
+    StreamId,
+    {data, Payload},
+    Fin,
+    #h3_stream{frame_state = expecting_data} = Stream,
+    State
 ) ->
     Stream1 = Stream#h3_stream{
         body = <<(Stream#h3_stream.body)/binary, Payload/binary>>,
@@ -2779,6 +2789,11 @@ do_update_stream_with_headers([{<<"priority">>, Value} | Rest], Stream, _SeenReg
     do_update_stream_with_headers(
         Rest, Stream#h3_stream{urgency = Urgency, incremental = Incremental}, true
     );
+%% RFC 9114 §4.3: any pseudo-header other than the ones defined above is
+%% undefined and makes the message malformed. (A known pseudo-header after
+%% a regular field is already rejected above.)
+do_update_stream_with_headers([{<<$:, _/binary>> = Name, _} | _], _Stream, _SeenRegular) ->
+    throw({header_error, {invalid_pseudo_header, Name}});
 do_update_stream_with_headers([_ | Rest], Stream, _SeenRegular) ->
     do_update_stream_with_headers(Rest, Stream, true).
 

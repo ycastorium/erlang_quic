@@ -955,7 +955,8 @@ decode_string(<<0:1, Len:7, Rest/binary>>) when byte_size(Rest) >= Len ->
     {Str, Rest2};
 decode_string(<<1:1, Len:7, Rest/binary>>) when byte_size(Rest) >= Len ->
     <<Encoded:Len/binary, Rest2/binary>> = Rest,
-    Decoded = quic_qpack_huffman:decode(Encoded),
+    %% Validate EOS/padding like the long-length path (RFC 7541 §5.2).
+    Decoded = huffman_decode_validated(Encoded),
     {Decoded, Rest2};
 decode_string(<<_:1, _Len:7, _Rest/binary>>) ->
     %% String length byte present but insufficient data
