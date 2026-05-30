@@ -115,12 +115,23 @@ he_winner_dies_with_owner_test_() ->
     {timeout, 30, fun he_winner_dies_with_owner/0}.
 
 he_winner_dies_with_owner() ->
-    {ok, Srv} = quic_test_echo_server:start(#{}),
+    case ipv6_available() of
+        false ->
+            ok;
+        true ->
+            do_he_winner_dies_with_owner()
+    end.
+
+do_he_winner_dies_with_owner() ->
+    %% Server on ::1 so the IPv6-first attempt (tried first) wins immediately:
+    %% "localhost" still resolves to two addresses, so the winner goes through
+    %% the supervised race rather than the caller-linked fast path.
+    {ok, Srv} = quic_test_echo_server:start(#{
+        extra_socket_opts => [{ip, {0, 0, 0, 0, 0, 0, 0, 1}}]
+    }),
     try
         #{port := Port} = Srv,
         Tester = self(),
-        %% "localhost" resolves to both ::1 and 127.0.0.1, so the connect goes
-        %% through the supervised race rather than the caller-linked fast path.
         Owner = spawn(fun() ->
             {ok, Conn} = quic:connect(
                 "localhost", Port, quic_test_echo_server:client_opts(), self()
