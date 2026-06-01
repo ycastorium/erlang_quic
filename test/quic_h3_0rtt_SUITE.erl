@@ -48,7 +48,6 @@
     session_ticket_emitted_inproc/1,
     session_ticket_emitted_aioquic/1,
     session_ticket_emitted_quic_go/1,
-    resumed_connection_0rtt_inproc/1,
     resumed_connection_0rtt_aioquic/1,
     rejected_emits_event_and_does_not_auto_retry/1,
     multiple_session_tickets_emitted/1,
@@ -67,7 +66,6 @@ all() ->
         session_ticket_emitted_inproc,
         session_ticket_emitted_aioquic,
         session_ticket_emitted_quic_go,
-        resumed_connection_0rtt_inproc,
         resumed_connection_0rtt_aioquic,
         rejected_emits_event_and_does_not_auto_retry,
         multiple_session_tickets_emitted,
@@ -170,49 +168,6 @@ run_session_ticket_emitted(Host, Port) ->
 %% Test cases - resumed connection with 0-RTT
 %%====================================================================
 
-%% Drive a full resumption against the in-process server:
-%%   1. Initial connect, wait for session_ticket.
-%%   2. Reconnect with the ticket in `quic_opts`.
-%%   3. Issue an immediate request and assert early_data_accepted/1
-%%      returns one of `true | false | unknown' (the wire outcome
-%%      depends on server policy; the assertion is that the accessor
-%%      works and a request still completes).
-resumed_connection_0rtt_inproc(Config) ->
-    Host = ?config(h3_host, Config),
-    Port = ?config(h3_port, Config),
-    %% Resumption support in the in-process server is best-effort:
-    %% it requires the server's NewSessionTicket payload to be
-    %% replayable against the same listener. When the server doesn't
-    %% support it cleanly we skip rather than fail — the unit tests
-    %% in quic_h3_early_data_tests + quic_resumption_tests cover the
-    %% client-side state machine. Trap exits so a crash inside
-    %% start_link doesn't propagate into the test process.
-    OldTrap = process_flag(trap_exit, true),
-    Outcome =
-        try
-            run_resumption_cycle(Host, Port, 5000)
-        catch
-            Class:CErr ->
-                {error, {Class, CErr}}
-        after
-            drain_exits(),
-            process_flag(trap_exit, OldTrap)
-        end,
-    case Outcome of
-        {ok, EarlyData, Status} ->
-            ct:pal(
-                "Resumed in-proc: early_data_accepted=~p status=~p",
-                [EarlyData, Status]
-            ),
-            ?assert(lists:member(EarlyData, [true, false, unknown])),
-            ?assertEqual(200, Status),
-            ok;
-        no_ticket ->
-            {skip, "in-proc server did not emit a session ticket"};
-        {error, Reason} ->
-            {skip, lists:flatten(io_lib:format("in-proc resumption not supported: ~p", [Reason]))}
-    end.
-
 resumed_connection_0rtt_aioquic(_Config) ->
     case discover_external(aioquic) of
         {skip, _} = Skip ->
@@ -235,8 +190,13 @@ resumed_connection_0rtt_aioquic(_Config) ->
                         "Resumed aioquic: early_data_accepted=~p status=~p",
                         [EarlyData, Status]
                     ),
-                    ?assert(lists:member(EarlyData, [true, false, unknown])),
-                    ?assert(is_integer(Status) andalso Status >= 200 andalso Status < 600),
+                    %% The server accepted 0-RTT — it echoed the empty
+                    %% early_data extension in EncryptedExtensions, so
+                    %% early_data_accepted/1 resolves to `true' (not the
+                    %% unprovable true|false|unknown range), and the resumed
+                    %% request completed successfully.
+                    ?assertEqual(true, EarlyData),
+                    ?assertEqual(200, Status),
                     ok;
                 no_ticket ->
                     {skip, "aioquic did not emit a session ticket"};
