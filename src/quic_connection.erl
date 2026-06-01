@@ -178,14 +178,7 @@
     test_decimate_step/1,
     test_decimate_on_timer_fire/1,
     test_maybe_send_ack_app/2,
-    test_classify_recv_trigger/2,
-    %% 0-RTT rejection (RFC 9001 §4.6.2)
-    test_state_for_zero_rtt_reset/3,
-    test_zero_rtt_reset_info/1,
-    test_finalize_zero_rtt_handshake/2,
-    test_reset_zero_rtt_streams/2,
-    test_client_state_for_ee/4,
-    test_process_encrypted_extensions/2
+    test_classify_recv_trigger/2
 ]).
 -endif.
 
@@ -11140,85 +11133,4 @@ test_maybe_send_ack_app(Trigger, State) ->
 test_classify_recv_trigger(PN, LargestRecv) ->
     classify_recv_trigger(PN, #pn_space{largest_recv = LargestRecv}).
 
-%% Build a minimal #state{} for 0-RTT rejection unit tests
-%% (RFC 9001 §4.6.2). `ZeroRttIds' seeds the tracking set, `Streams'
-%% pre-populates the stream map (values are opaque to the helper logic).
--spec test_state_for_zero_rtt_reset(
-    pid(),
-    #{non_neg_integer() => term()},
-    [non_neg_integer()]
-) -> #state{}.
-test_state_for_zero_rtt_reset(Owner, Streams, ZeroRttIds) ->
-    #state{
-        owner = Owner,
-        streams = Streams,
-        zero_rtt_stream_ids = sets:from_list(ZeroRttIds, [{version, 2}])
-    }.
-
-%% Surface the relevant fields of #state{} as a plain map so test code
-%% can inspect them without depending on the internal record shape.
--spec test_zero_rtt_reset_info(#state{}) ->
-    #{
-        streams := #{non_neg_integer() => term()},
-        zero_rtt_stream_ids := [non_neg_integer()]
-    }.
-test_zero_rtt_reset_info(#state{streams = Streams, zero_rtt_stream_ids = Ids}) ->
-    #{
-        streams => Streams,
-        zero_rtt_stream_ids => lists:sort(sets:to_list(Ids))
-    }.
-
-%% Drive the handshake-completion branch in isolation: set
-%% `early_data_accepted' and invoke the same finalisation logic the
-%% real handshake path uses.
--spec test_finalize_zero_rtt_handshake(#state{}, boolean()) -> #state{}.
-test_finalize_zero_rtt_handshake(State, Accepted) ->
-    finalize_zero_rtt_state(State#state{early_data_accepted = Accepted}).
-
-%% Test-only wrapper around the internal `reset_zero_rtt_streams/2'.
-%% Keeps the API surface private (the function takes a `#state{}'
-%% record that no out-of-module caller can construct) while still
-%% giving tests direct access.
--spec test_reset_zero_rtt_streams([non_neg_integer()], #state{}) -> #state{}.
-test_reset_zero_rtt_streams(RejectedIds, State) ->
-    reset_zero_rtt_streams(RejectedIds, State).
-
-%% Build a minimal client-side `#state{}' suitable for driving the
-%% TLS_ENCRYPTED_EXTENSIONS handler. When `OfferedZeroRtt' is true,
-%% `early_keys' is populated with a placeholder marker so the EE-handler
-%% recognises that 0-RTT was actually offered by this client.
--spec test_client_state_for_ee(
-    pid(),
-    #{non_neg_integer() => term()},
-    [non_neg_integer()],
-    boolean()
-) -> #state{}.
-test_client_state_for_ee(Owner, Streams, ZeroRttIds, OfferedZeroRtt) ->
-    EarlyKeys =
-        case OfferedZeroRtt of
-            true ->
-                {
-                    #crypto_keys{
-                        key = <<0:128>>, iv = <<0:96>>, hp = <<0:128>>, cipher = aes_128_gcm
-                    },
-                    <<0:256>>
-                };
-            false ->
-                undefined
-        end,
-    #state{
-        role = client,
-        owner = Owner,
-        streams = Streams,
-        zero_rtt_stream_ids = sets:from_list(ZeroRttIds, [{version, 2}]),
-        early_keys = EarlyKeys,
-        tls_state = ?TLS_AWAITING_ENCRYPTED_EXT,
-        tls_transcript = <<>>
-    }.
-
-%% Drive the client-side EncryptedExtensions handler directly with a
-%% pre-built EE body. Returns the resulting `#state{}'.
--spec test_process_encrypted_extensions(#state{}, binary()) -> #state{}.
-test_process_encrypted_extensions(State, Body) ->
-    process_tls_message(handshake, ?TLS_ENCRYPTED_EXTENSIONS, Body, Body, State).
 -endif.
