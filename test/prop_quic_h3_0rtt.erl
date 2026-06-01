@@ -57,25 +57,27 @@ request_seq_gen() ->
 %%====================================================================
 
 prop_session_ticket_forwarding_is_lossless() ->
-    ?FORALL(
-        Tickets,
-        session_tickets_gen(),
-        begin
-            ok = setup_meck(true),
-            FakeQC = spawn_fake_quic(),
-            {ok, H3} = start_h3_in_early_data(FakeQC),
-            ok = drain_owner_mailbox(H3),
-            lists:foreach(
-                fun(T) ->
-                    H3 ! {quic, FakeQC, {session_ticket, T}}
-                end,
-                Tickets
-            ),
-            Received = collect_forwarded_tickets(H3, length(Tickets), ?WAIT_MS),
-            teardown_h3(H3, FakeQC),
-            teardown_meck(),
-            Received =:= Tickets
-        end
+    ?SETUP(
+        fun mock_quic/0,
+        ?FORALL(
+            Tickets,
+            session_tickets_gen(),
+            begin
+                reset_stream_counters(),
+                FakeQC = spawn_fake_quic(),
+                {ok, H3} = start_h3_in_early_data(FakeQC),
+                ok = drain_owner_mailbox(H3),
+                lists:foreach(
+                    fun(T) ->
+                        H3 ! {quic, FakeQC, {session_ticket, T}}
+                    end,
+                    Tickets
+                ),
+                Received = collect_forwarded_tickets(H3, length(Tickets), ?WAIT_MS),
+                teardown_h3(H3, FakeQC),
+                Received =:= Tickets
+            end
+        )
     ).
 
 %%====================================================================
@@ -92,24 +94,26 @@ prop_session_ticket_forwarding_is_lossless() ->
 %%====================================================================
 
 prop_postponed_requests_replayed_without_loss() ->
-    ?FORALL(
-        Requests,
-        request_seq_gen(),
-        begin
-            ok = setup_meck(true),
-            FakeQC = spawn_fake_quic(),
-            {ok, H3} = quic_h3_connection:start_link(FakeQC, <<"example.com">>, 443, #{}),
-            unlink(H3),
-            bootstrapping = current_state(H3),
-            CallerPids = spawn_requesters(H3, Requests),
-            wait_postponed_calls(H3, length(Requests), ?WAIT_MS),
-            ok = quic_h3_connection:prime(H3),
-            wait_state(H3, early_data, ?WAIT_MS),
-            Results = collect_request_results(CallerPids, ?WAIT_MS),
-            teardown_h3(H3, FakeQC),
-            teardown_meck(),
-            check_request_results(Results, length(Requests))
-        end
+    ?SETUP(
+        fun mock_quic/0,
+        ?FORALL(
+            Requests,
+            request_seq_gen(),
+            begin
+                reset_stream_counters(),
+                FakeQC = spawn_fake_quic(),
+                {ok, H3} = quic_h3_connection:start_link(FakeQC, <<"example.com">>, 443, #{}),
+                unlink(H3),
+                bootstrapping = current_state(H3),
+                CallerPids = spawn_requesters(H3, Requests),
+                wait_postponed_calls(H3, length(Requests), ?WAIT_MS),
+                ok = quic_h3_connection:prime(H3),
+                wait_state(H3, early_data, ?WAIT_MS),
+                Results = collect_request_results(CallerPids, ?WAIT_MS),
+                teardown_h3(H3, FakeQC),
+                check_request_results(Results, length(Requests))
+            end
+        )
     ).
 
 %%====================================================================
@@ -138,6 +142,21 @@ proper_test_() ->
 %% Helpers
 %%====================================================================
 
+%% Install the `quic' mock once per property run (PropEr ?SETUP) and
+%% return the finalizer. Re-mocking the large, cover-compiled `quic'
+%% god-module on every ?FORALL iteration serialised through the global
+%% cover_server and made meck_proc:start/2 time out under CI load.
+mock_quic() ->
+    ok = setup_meck(true),
+    fun teardown_meck/0.
+
+%% Restart the per-run stream-id counters at the top of each iteration so
+%% ids restart at 0 even though the mock is installed once per property.
+reset_stream_counters() ->
+    counters:put(persistent_term:get({?MODULE, uni_counter}), 1, 0),
+    counters:put(persistent_term:get({?MODULE, bidi_counter}), 1, 0),
+    ok.
+
 setup_meck(HasEarlyKeys) ->
     catch meck:unload(quic),
     meck:new(quic, [passthrough]),
@@ -149,6 +168,8 @@ setup_meck(HasEarlyKeys) ->
     meck:expect(quic, early_data_accepted, fun(_) -> unknown end),
     UniCounter = counters:new(1, []),
     BidiCounter = counters:new(1, []),
+    persistent_term:put({?MODULE, uni_counter}, UniCounter),
+    persistent_term:put({?MODULE, bidi_counter}, BidiCounter),
     meck:expect(quic, open_unidirectional_stream, fun(_) ->
         counters:add(UniCounter, 1, 1),
         N = counters:get(UniCounter, 1),
@@ -164,6 +185,8 @@ setup_meck(HasEarlyKeys) ->
 
 teardown_meck() ->
     catch meck:unload(quic),
+    persistent_term:erase({?MODULE, uni_counter}),
+    persistent_term:erase({?MODULE, bidi_counter}),
     ok.
 
 spawn_fake_quic() ->
@@ -293,7 +316,20 @@ check_request_results(Results, N) ->
 
 teardown_h3(H3, FakeQC) ->
     catch unlink(H3),
-    catch exit(H3, shutdown),
+    wait_down(H3, shutdown),
     catch unlink(FakeQC),
-    catch exit(FakeQC, shutdown),
+    wait_down(FakeQC, shutdown),
     ok.
+
+%% Stop a helper process and block until it is actually dead, so no
+%% iteration leaves an H3 still executing a mocked `quic' call when the
+%% next iteration (or the ?SETUP finalizer's meck:unload) runs.
+wait_down(Pid, Reason) ->
+    MRef = erlang:monitor(process, Pid),
+    catch exit(Pid, Reason),
+    receive
+        {'DOWN', MRef, process, Pid, _} -> ok
+    after ?WAIT_MS ->
+        erlang:demonitor(MRef, [flush]),
+        ok
+    end.
