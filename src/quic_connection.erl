@@ -868,7 +868,7 @@ get_stats(Conn) ->
 has_early_keys(Conn) ->
     gen_statem:call(Conn, has_early_keys).
 
-%% @doc Returns whether the server accepted early data, or `unknown`
+%% @doc Returns whether the server accepted early data, or `unknown'
 %% if the handshake has not yet completed. Useful only after the
 %% connection enters the connected state to confirm that 0-RTT was
 %% actually used.
